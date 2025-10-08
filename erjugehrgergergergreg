@@ -20,7 +20,8 @@ local CONFIG = {
     JSONBIN_BASE_URL = "https://api.jsonbin.io/v3",
     
     -- Game Configuration
-    UNIVERSE_ID = 109983668079237,
+    UNIVERSE_ID = 109983668079237, -- place/universe id used for teleport (ensure this is PlaceId, not universe id if different)
+    PLACE_ID = 109983668079237,    -- explicit place id (change if different from universe)
     
     -- Timing
     CHECK_INTERVAL = 0.25, -- base polling interval (reduced)
@@ -229,22 +230,26 @@ end
 
 local function attemptTeleport(jobId)
     if State.isAttemptingJoin then return false end
+    if not jobId or jobId == "" then
+        logError("AttemptTeleport called with nil/empty jobId")
+        return false
+    end
     State.isAttemptingJoin = true
-    if not CONFIG.FAST_MODE then log("Attempt teleport -> " .. jobId) end
+    if not CONFIG.FAST_MODE then log("Attempt teleport -> " .. tostring(jobId)) end
     local player = Players.LocalPlayer
     local success, errorMessage = pcall(function()
-        TeleportService:TeleportToPlaceInstance(CONFIG.UNIVERSE_ID, jobId, player)
+        TeleportService:TeleportToPlaceInstance(CONFIG.PLACE_ID or CONFIG.UNIVERSE_ID, jobId, player)
     end)
     if not success then
         local reason = parseErrorReason(errorMessage)
-        logError("Teleport failed: " .. reason)
+        logError("Teleport failed: " .. reason .. " | jobId=" .. tostring(jobId))
         blockJobId(jobId, reason)
         State.isAttemptingJoin = false
         State.currentJobId = nil
         State.retryCount = State.retryCount + 1
         return false
     end
-    if not CONFIG.FAST_MODE then log("Teleport initiated") end
+    if not CONFIG.FAST_MODE then log("Teleport initiated jobId=" .. tostring(jobId)) end
     return true
 end
 
@@ -298,8 +303,16 @@ local function mainLoop()
             end
             if State.currentJobId then
                 -- Pre-block it so others can't pick it concurrently
-                preBlockJobId(State.currentJobId)
-                local ok = attemptTeleport(State.currentJobId)
+                local jid = State.currentJobId
+                if jid and jid ~= "" then
+                    preBlockJobId(jid)
+                    local ok = attemptTeleport(jid)
+                    if not ok then
+                        -- release attempt? (already blocklisted to avoid thrash)
+                    end
+                else
+                    State.currentJobId = nil
+                end
                 if not ok then
                     -- immediate new try next loop
                 end
