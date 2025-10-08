@@ -1,6 +1,6 @@
--- FULLY AUTOMATIC ROBLOX HOPPER - DIRECT JSONBIN CONNECTION
--- This script connects DIRECTLY to JsonBin API
--- NO backend needed! NO manual injection needed!
+-- FULLY AUTOMATIC ROBLOX HOPPER - DIRECT JSONSILO CONNECTION
+-- This script connects DIRECTLY to JsonSilo public JSON endpoint
+-- NO backend server needed. Public URL is read-only; write attempts may fail silently if not permitted.
 
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
@@ -14,10 +14,13 @@ end
 
 -- ===== CONFIGURATION =====
 local CONFIG = {
-    -- JsonBin Configuration
-    JSONBIN_BIN_ID = "68e5b4da43b1c97be95e2d78", -- Your Bin ID
-    JSONBIN_API_KEY = "$2a$10$SIoE.UZL2BZQZnrlbKzRneosbcnRdkXrh01ZjpUJQfZxvyi.Wky5e", -- Your API Key
-    JSONBIN_BASE_URL = "https://api.jsonbin.io/v3",
+    -- JsonSilo Configuration
+    STORAGE_MODE = "local", -- "local" or "jsonsilo"
+    LOCAL_FILE_PATH = "C:/Users/ghait/AppData/Local/Wave/workspace/JobidJson.json", -- Windows absolute path
+    JSONSILO_PUBLIC_URL = "https://api.jsonsilo.com/public/cf8de3c7-8be4-4df5-aae5-1403645bab01",
+    JSONSILO_WRITE_URL = "https://api.jsonsilo.com/public/cf8de3c7-8be4-4df5-aae5-1403645bab01",
+    JSONSILO_API_KEY = nil,
+    JSONSILO_API_KEY_HEADER = "X-API-Key",
     
     -- Game Configuration
     UNIVERSE_ID = 109983668079237, -- place/universe id used for teleport (ensure this is PlaceId, not universe id if different)
@@ -61,62 +64,113 @@ end
 local function logError(message) log(message, "ERROR") end
 local function logWarning(message) log(message, "WARN") end
 
--- ===== JSONBIN API =====
+-- ===== STORAGE (JsonSilo / Local File) =====
 local _cache = { data = nil, ts = 0 }
-local function readFromJsonBin(force)
+
+local function buildHeaders(isWrite)
+    local headers = { ["Content-Type"] = "application/json" }
+    if CONFIG.JSONSILO_API_KEY and CONFIG.JSONSILO_API_KEY ~= "" then
+        headers[CONFIG.JSONSILO_API_KEY_HEADER] = CONFIG.JSONSILO_API_KEY
+    end
+    return headers
+end
+
+local function readLocalFile()
+    if not isfile or not readfile then
+        logError("Executor does not expose file APIs (isfile/readfile)")
+        return nil
+    end
+    if not isfile(CONFIG.LOCAL_FILE_PATH) then
+        logWarning("Local file missing: " .. CONFIG.LOCAL_FILE_PATH)
+        return nil
+    end
+    local ok, content = pcall(readfile, CONFIG.LOCAL_FILE_PATH)
+    if not ok then
+        logError("Failed to read local file: " .. tostring(content))
+        return nil
+    end
+    local success, decoded = pcall(function() return HttpService:JSONDecode(content) end)
+    if not success then
+        logError("Invalid JSON in local file")
+        return nil
+    end
+    return decoded
+end
+
+local function writeLocalFile(tbl)
+    if not writefile then return false end
+    local ok, err = pcall(function()
+        writefile(CONFIG.LOCAL_FILE_PATH, HttpService:JSONEncode(tbl))
+    end)
+    if not ok then
+        logWarning("Failed writing local file: " .. tostring(err))
+        return false
+    end
+    return true
+end
+
+local function storageRead(force)
     local now = os.clock()
     if not force and _cache.data and (now - _cache.ts) < CONFIG.JSON_CACHE_TTL then
         return _cache.data
     end
-    if not CONFIG.FAST_MODE then log("📡 Reading from JsonBin...") end
-    local success, result = pcall(function()
-        local response = request({
-            Url = CONFIG.JSONBIN_BASE_URL .. "/b/" .. CONFIG.JSONBIN_BIN_ID .. "/latest",
-            Method = "GET",
-            Headers = { ["X-Master-Key"] = CONFIG.JSONBIN_API_KEY }
-        })
-        if response.Success and response.StatusCode == 200 then
-            return HttpService:JSONDecode(response.Body).record
+    local result = nil
+    if CONFIG.STORAGE_MODE == "local" then
+        result = readLocalFile()
+    else
+        if not CONFIG.FAST_MODE then log("📡 Reading from JsonSilo...") end
+        local success, resp = pcall(function()
+            local response = request({
+                Url = CONFIG.JSONSILO_PUBLIC_URL,
+                Method = "GET",
+                Headers = buildHeaders(false)
+            })
+            if response.Success and response.StatusCode == 200 then
+                return HttpService:JSONDecode(response.Body)
+            else
+                error("HTTP " .. tostring(response.StatusCode))
+            end
+        end)
+        if success then
+            result = resp
         else
-            error("HTTP " .. tostring(response.StatusCode))
+            logError("Failed to read JsonSilo: " .. tostring(resp))
         end
-    end)
-    if success then
+    end
+    if result then
         _cache.data = result
         _cache.ts = now
-        if not CONFIG.FAST_MODE then log("✅ Successfully read from JsonBin") end
         return result
-    else
-        logError("Failed to read from JsonBin: " .. tostring(result))
-        return nil
     end
+    return nil
 end
 
-local function writeToJsonBin(data)
-    if not CONFIG.FAST_MODE then log("💾 Writing to JsonBin...") end
+local function storageWrite(data)
+    if CONFIG.STORAGE_MODE == "local" then
+        return writeLocalFile(data)
+    end
+    if not CONFIG.FAST_MODE then log("💾 Writing to JsonSilo...") end
     local success, result = pcall(function()
         local response = request({
-            Url = CONFIG.JSONBIN_BASE_URL .. "/b/" .. CONFIG.JSONBIN_BIN_ID,
+            Url = CONFIG.JSONSILO_WRITE_URL,
             Method = "PUT",
-            Headers = { ["Content-Type"] = "application/json", ["X-Master-Key"] = CONFIG.JSONBIN_API_KEY },
+            Headers = buildHeaders(true),
             Body = HttpService:JSONEncode(data)
         })
-        if response.Success and response.StatusCode == 200 then return true else error("HTTP " .. tostring(response.StatusCode)) end
+        if response.Success and (response.StatusCode == 200 or response.StatusCode == 201) then return true else error("HTTP " .. tostring(response.StatusCode)) end
     end)
     if success then
         _cache.data = data
         _cache.ts = os.clock()
-        if not CONFIG.FAST_MODE then log("✅ Successfully wrote to JsonBin") end
         return true
-    else
-        logError("Failed to write to JsonBin: " .. tostring(result))
-        return false
     end
+    logWarning("Write failed: " .. tostring(result))
+    return false
 end
 
 -- ===== JOB ID MANAGEMENT =====
 local function getNextJobId()
-    local data = readFromJsonBin()
+    local data = storageRead()
     if not data then return nil end
     local available = data.availableJobIds or {}
     local blocklist = data.blocklist or {}
@@ -152,7 +206,7 @@ local function blockJobId(jobId, reason)
     -- Add to local blocklist immediately
     table.insert(_G.ServerHopperShared.localBlocklist, jobId)
     
-    local data = readFromJsonBin()
+    local data = storageRead()
     if not data then return false end
     
     -- Add to blocklist if not already there
@@ -179,7 +233,7 @@ local function blockJobId(jobId, reason)
         end
         data.availableJobIds = newAvailable
         
-        if writeToJsonBin(data) then
+    if storageWrite(data) then
             log("✅ JobId blocked and removed from available list")
             return true
         end
@@ -193,7 +247,7 @@ end
 -- Pre-block job id (lightweight: edits JsonBin once) so no other account selects it while we are teleporting
 local function preBlockJobId(jobId)
     -- read cached (force refresh)
-    local data = readFromJsonBin(true)
+    local data = storageRead(true)
     if not data then return false end
     data.blocklist = data.blocklist or {}
     -- already blocked? then fine
@@ -205,7 +259,7 @@ local function preBlockJobId(jobId)
         for _, id in ipairs(data.availableJobIds) do if id ~= jobId then table.insert(filtered, id) end end
         data.availableJobIds = filtered
     end
-    if writeToJsonBin(data) then
+    if storageWrite(data) then
         -- also reflect in cache structures
         _G.ServerHopperShared.localBlocklist[jobId] = true
         return true
@@ -258,11 +312,16 @@ end
 -- ===== MAIN LOOP =====
 local function mainLoop()
     log("╔════════════════════════════════════════════════════════════╗")
-    log("║     🎮 FULLY AUTOMATIC SERVER HOPPER - JSONBIN DIRECT     ║")
+    local mode = CONFIG.STORAGE_MODE == "local" and "LOCAL FILE" or "JSONSILO"
+    log("║     🎮 FULLY AUTOMATIC SERVER HOPPER - " .. mode .. " MODE    ║")
     log("╚════════════════════════════════════════════════════════════╝")
     log("Client ID: " .. CONFIG.CLIENT_ID)
     log("Universe ID: " .. CONFIG.UNIVERSE_ID)
-    log("JsonBin Bin ID: " .. CONFIG.JSONBIN_BIN_ID)
+    if CONFIG.STORAGE_MODE == "local" then
+        log("Local File: " .. CONFIG.LOCAL_FILE_PATH)
+    else
+        log("JsonSilo URL: " .. CONFIG.JSONSILO_PUBLIC_URL)
+    end
     log("════════════════════════════════════════════════════════════")
     
     -- Removed auto-block of current server; we only block the NEXT one we select (pre-block before teleport)
@@ -273,18 +332,22 @@ local function mainLoop()
     repeat
         attempt += 1
         if attempt == 1 then
-            log("🔍 Testing JsonBin connection...")
+            if CONFIG.STORAGE_MODE == "local" then
+                log("🔍 Loading local file...")
+            else
+                log("🔍 Testing JsonSilo connection...")
+            end
         else
-            logWarning("Retrying JsonBin connection (attempt " .. attempt .. ")")
+            logWarning("Retrying storage read (attempt " .. attempt .. ")")
         end
-        testData = readFromJsonBin(true)
+    testData = storageRead(true)
         if not testData then
             local backoff = math.min(10, 1 * 2 ^ math.min(6, attempt - 1)) -- 1,2,4,8,10,10...
-            logWarning("JsonBin unreachable. Backing off for " .. backoff .. "s")
+            logWarning("Storage unreadable. Backing off for " .. backoff .. "s")
             wait(backoff)
         end
     until testData ~= nil
-    log("✅ JsonBin connection established after " .. attempt .. " attempt(s)")
+    log("✅ Storage ready after " .. attempt .. " attempt(s)")
     log("📊 Found " .. #(testData.availableJobIds or {}) .. " available JobIds")
     log("")
     
