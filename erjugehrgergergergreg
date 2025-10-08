@@ -189,6 +189,29 @@ local function blockJobId(jobId, reason)
     return false
 end
 
+-- Pre-block job id (lightweight: edits JsonBin once) so no other account selects it while we are teleporting
+local function preBlockJobId(jobId)
+    -- read cached (force refresh)
+    local data = readFromJsonBin(true)
+    if not data then return false end
+    data.blocklist = data.blocklist or {}
+    -- already blocked? then fine
+    for _, b in ipairs(data.blocklist) do if b == jobId then return true end end
+    table.insert(data.blocklist, jobId)
+    -- remove from available list immediately
+    if data.availableJobIds then
+        local filtered = {}
+        for _, id in ipairs(data.availableJobIds) do if id ~= jobId then table.insert(filtered, id) end end
+        data.availableJobIds = filtered
+    end
+    if writeToJsonBin(data) then
+        -- also reflect in cache structures
+        _G.ServerHopperShared.localBlocklist[jobId] = true
+        return true
+    end
+    return false
+end
+
 -- ===== TELEPORT LOGIC =====
 local function parseErrorReason(errorMsg)
     local errorLower = tostring(errorMsg):lower()
@@ -235,11 +258,7 @@ local function mainLoop()
     log("JsonBin Bin ID: " .. CONFIG.JSONBIN_BIN_ID)
     log("════════════════════════════════════════════════════════════")
     
-    -- Block current server immediately on startup
-    if game.JobId and game.JobId ~= "" then
-        log("🚫 Blocking current server: " .. game.JobId)
-        blockJobId(game.JobId, "Starting server (auto-blocked)")
-    end
+    -- Removed auto-block of current server; we only block the NEXT one we select (pre-block before teleport)
     
     -- Test JsonBin connection
     log("🔍 Testing JsonBin connection...")
@@ -278,6 +297,8 @@ local function mainLoop()
                 end
             end
             if State.currentJobId then
+                -- Pre-block it so others can't pick it concurrently
+                preBlockJobId(State.currentJobId)
                 local ok = attemptTeleport(State.currentJobId)
                 if not ok then
                     -- immediate new try next loop
