@@ -1,0 +1,325 @@
+-- FULLY AUTOMATIC ROBLOX HOPPER - DIRECT JSONBIN CONNECTION
+-- This script connects DIRECTLY to JsonBin API
+-- NO backend needed! NO manual injection needed!
+
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local Players = game:GetService("Players")
+
+-- Use executor's request function (same as your working script)
+local request = syn and syn.request or http and http.request or http_request or fluxus and fluxus.request
+if not request then 
+    error("❌ No HTTP request function found! Your executor may not support HTTP requests.") 
+end
+
+-- ===== CONFIGURATION =====
+local CONFIG = {
+    -- JsonBin Configuration
+    JSONBIN_BIN_ID = "68e5b4da43b1c97be95e2d78", -- Your Bin ID
+    JSONBIN_API_KEY = "$2a$10$SIoE.UZL2BZQZnrlbKzRneosbcnRdkXrh01ZjpUJQfZxvyi.Wky5e", -- Your API Key
+    JSONBIN_BASE_URL = "https://api.jsonbin.io/v3",
+    
+    -- Game Configuration
+    UNIVERSE_ID = 109983668079237,
+    
+    -- Timing
+    CHECK_INTERVAL = 0.25, -- base polling interval (reduced)
+    RETRY_DELAY = 0.5,     -- delay after failure (short)
+    MAX_RETRY_ATTEMPTS = 3,
+    FAST_MODE = true,      -- enable aggressive speed optimizations
+    JSON_CACHE_TTL = 2,    -- seconds to cache JsonBin read
+    MAX_LOOP_BURST = 15,   -- max rapid iterations before yielding
+    
+    -- Client ID (unique per account)
+    CLIENT_ID = HttpService:GenerateGUID(false)
+}
+
+-- ===== SHARED GLOBAL STATE (across all accounts) =====
+_G.ServerHopperShared = _G.ServerHopperShared or {
+    assignedJobIds = {}, -- JobIds currently assigned to any account
+    localBlocklist = {} -- Local blocklist cached from JsonBin
+}
+
+-- ===== STATE =====
+local State = {
+    currentJobId = nil,
+    isAttemptingJoin = false,
+    retryCount = 0,
+    assignedJobIds = {}, -- Track what this client has been assigned
+    lastBlocklistCheck = 0 -- Last time we checked blocklist
+}
+
+-- ===== LOGGING =====
+local function log(message, level)
+    if CONFIG.FAST_MODE and level ~= "ERROR" and level ~= "WARN" then return end
+    level = level or "INFO"
+    local timestamp = os.date("%H:%M:%S")
+    print(string.format("[%s][%s] %s", timestamp, level, message))
+end
+
+local function logError(message) log(message, "ERROR") end
+local function logWarning(message) log(message, "WARN") end
+
+-- ===== JSONBIN API =====
+local _cache = { data = nil, ts = 0 }
+local function readFromJsonBin(force)
+    local now = os.clock()
+    if not force and _cache.data and (now - _cache.ts) < CONFIG.JSON_CACHE_TTL then
+        return _cache.data
+    end
+    if not CONFIG.FAST_MODE then log("📡 Reading from JsonBin...") end
+    local success, result = pcall(function()
+        local response = request({
+            Url = CONFIG.JSONBIN_BASE_URL .. "/b/" .. CONFIG.JSONBIN_BIN_ID .. "/latest",
+            Method = "GET",
+            Headers = { ["X-Master-Key"] = CONFIG.JSONBIN_API_KEY }
+        })
+        if response.Success and response.StatusCode == 200 then
+            return HttpService:JSONDecode(response.Body).record
+        else
+            error("HTTP " .. tostring(response.StatusCode))
+        end
+    end)
+    if success then
+        _cache.data = result
+        _cache.ts = now
+        if not CONFIG.FAST_MODE then log("✅ Successfully read from JsonBin") end
+        return result
+    else
+        logError("Failed to read from JsonBin: " .. tostring(result))
+        return nil
+    end
+end
+
+local function writeToJsonBin(data)
+    if not CONFIG.FAST_MODE then log("💾 Writing to JsonBin...") end
+    local success, result = pcall(function()
+        local response = request({
+            Url = CONFIG.JSONBIN_BASE_URL .. "/b/" .. CONFIG.JSONBIN_BIN_ID,
+            Method = "PUT",
+            Headers = { ["Content-Type"] = "application/json", ["X-Master-Key"] = CONFIG.JSONBIN_API_KEY },
+            Body = HttpService:JSONEncode(data)
+        })
+        if response.Success and response.StatusCode == 200 then return true else error("HTTP " .. tostring(response.StatusCode)) end
+    end)
+    if success then
+        _cache.data = data
+        _cache.ts = os.clock()
+        if not CONFIG.FAST_MODE then log("✅ Successfully wrote to JsonBin") end
+        return true
+    else
+        logError("Failed to write to JsonBin: " .. tostring(result))
+        return false
+    end
+end
+
+-- ===== JOB ID MANAGEMENT =====
+local function getNextJobId()
+    local data = readFromJsonBin()
+    if not data then return nil end
+    local available = data.availableJobIds or {}
+    local blocklist = data.blocklist or {}
+    if #available == 0 then return nil end
+    -- build fast lookup sets once per call
+    local blockedSet = {}
+    for _, b in ipairs(blocklist) do blockedSet[b] = true end
+    local triedSet = {}
+    for _, t in ipairs(State.assignedJobIds) do triedSet[t] = true end
+    local globalAssigned = _G.ServerHopperShared.assignedJobIds
+    -- reservoir style random pick without building big tables
+    local pick = nil
+    local count = 0
+    for _, jobId in ipairs(available) do
+        if not blockedSet[jobId] and not triedSet[jobId] and (not globalAssigned[jobId] or globalAssigned[jobId] == CONFIG.CLIENT_ID) then
+            count = count + 1
+            if math.random(count) == 1 then pick = jobId end
+        end
+    end
+    if not pick then
+        logWarning("No valid JobId (all blocked/used)")
+        return nil
+    end
+    table.insert(State.assignedJobIds, pick)
+    globalAssigned[pick] = CONFIG.CLIENT_ID
+    if not CONFIG.FAST_MODE then log("Selected JobId: " .. pick) end
+    return pick
+end
+
+local function blockJobId(jobId, reason)
+    log("🚫 Blocking JobId: " .. jobId .. " | Reason: " .. reason)
+    
+    -- Add to local blocklist immediately
+    table.insert(_G.ServerHopperShared.localBlocklist, jobId)
+    
+    local data = readFromJsonBin()
+    if not data then return false end
+    
+    -- Add to blocklist if not already there
+    local blocklist = data.blocklist or {}
+    local alreadyBlocked = false
+    
+    for _, blockedId in ipairs(blocklist) do
+        if blockedId == jobId then
+            alreadyBlocked = true
+            break
+        end
+    end
+    
+    if not alreadyBlocked then
+        table.insert(blocklist, jobId)
+        data.blocklist = blocklist
+        
+        -- REMOVE from availableJobIds list
+        local newAvailable = {}
+        for _, id in ipairs(data.availableJobIds or {}) do
+            if id ~= jobId then
+                table.insert(newAvailable, id)
+            end
+        end
+        data.availableJobIds = newAvailable
+        
+        if writeToJsonBin(data) then
+            log("✅ JobId blocked and removed from available list")
+            return true
+        end
+    else
+        log("ℹ️  JobId already blocked")
+    end
+    
+    return false
+end
+
+-- ===== TELEPORT LOGIC =====
+local function parseErrorReason(errorMsg)
+    local errorLower = tostring(errorMsg):lower()
+    
+    if string.find(errorLower, "full") or string.find(errorLower, "capacity") then
+        return "Server is full"
+    elseif string.find(errorLower, "invalid") or string.find(errorLower, "not found") then
+        return "Invalid or closed server"
+    elseif string.find(errorLower, "restricted") or string.find(errorLower, "private") then
+        return "Server is private or restricted"
+    else
+        return "Unknown error: " .. tostring(errorMsg)
+    end
+end
+
+local function attemptTeleport(jobId)
+    if State.isAttemptingJoin then return false end
+    State.isAttemptingJoin = true
+    if not CONFIG.FAST_MODE then log("Attempt teleport -> " .. jobId) end
+    local player = Players.LocalPlayer
+    local success, errorMessage = pcall(function()
+        TeleportService:TeleportToPlaceInstance(CONFIG.UNIVERSE_ID, jobId, player)
+    end)
+    if not success then
+        local reason = parseErrorReason(errorMessage)
+        logError("Teleport failed: " .. reason)
+        blockJobId(jobId, reason)
+        State.isAttemptingJoin = false
+        State.currentJobId = nil
+        State.retryCount = State.retryCount + 1
+        return false
+    end
+    if not CONFIG.FAST_MODE then log("Teleport initiated") end
+    return true
+end
+
+-- ===== MAIN LOOP =====
+local function mainLoop()
+    log("╔════════════════════════════════════════════════════════════╗")
+    log("║     🎮 FULLY AUTOMATIC SERVER HOPPER - JSONBIN DIRECT     ║")
+    log("╚════════════════════════════════════════════════════════════╝")
+    log("Client ID: " .. CONFIG.CLIENT_ID)
+    log("Universe ID: " .. CONFIG.UNIVERSE_ID)
+    log("JsonBin Bin ID: " .. CONFIG.JSONBIN_BIN_ID)
+    log("════════════════════════════════════════════════════════════")
+    
+    -- Block current server immediately on startup
+    if game.JobId and game.JobId ~= "" then
+        log("🚫 Blocking current server: " .. game.JobId)
+        blockJobId(game.JobId, "Starting server (auto-blocked)")
+    end
+    
+    -- Test JsonBin connection
+    log("🔍 Testing JsonBin connection...")
+    local testData = readFromJsonBin()
+    
+    if not testData then
+        logError("❌ CANNOT CONNECT TO JSONBIN!")
+        logError("Please check:")
+        logError("1. HttpService is enabled in your executor")
+        logError("2. JsonBin API key is correct")
+        logError("3. JsonBin Bin ID is correct")
+        return
+    end
+    
+    log("✅ JsonBin connection successful!")
+    log("📊 Found " .. #(testData.availableJobIds or {}) .. " available JobIds")
+    log("")
+    
+    local burst = 0
+    while true do
+        -- Already in server we targeted
+        if game.JobId ~= "" and game.JobId == State.currentJobId then
+            -- slow down while settled
+            wait(5)
+        else
+            if State.retryCount >= CONFIG.MAX_RETRY_ATTEMPTS then
+                if State.currentJobId then blockJobId(State.currentJobId, "Max retries exceeded") end
+                State.currentJobId = nil
+                State.retryCount = 0
+                wait(CONFIG.RETRY_DELAY)
+            end
+            if not State.currentJobId then
+                State.currentJobId = getNextJobId()
+                if not State.currentJobId then
+                    wait(CONFIG.RETRY_DELAY)
+                end
+            end
+            if State.currentJobId then
+                local ok = attemptTeleport(State.currentJobId)
+                if not ok then
+                    -- immediate new try next loop
+                end
+            end
+        end
+        burst = burst + 1
+        if burst >= CONFIG.MAX_LOOP_BURST then
+            burst = 0
+            wait(CONFIG.CHECK_INTERVAL)
+        else
+            task.wait() -- yield briefly
+        end
+    end
+end
+
+-- ===== EVENT HANDLERS =====
+Players.LocalPlayer.OnTeleport:Connect(function(state)
+    if state == Enum.TeleportState.Started then
+        log("🔄 Teleport started...")
+    elseif state == Enum.TeleportState.InProgress then
+        log("🔄 Teleport in progress...")
+    elseif state == Enum.TeleportState.Failed then
+        logError("❌ Teleport failed!")
+        if State.currentJobId then
+            blockJobId(State.currentJobId, "Teleport failed (OnTeleport event)")
+            State.currentJobId = nil
+        end
+        State.isAttemptingJoin = false
+    end
+end)
+
+-- ===== STARTUP =====
+log("Initializing direct JsonBin hopper...")
+wait(2)
+
+-- Start the main loop
+spawn(function()
+    local success, error = pcall(mainLoop)
+    if not success then
+        logError("💀 Fatal error: " .. tostring(error))
+    end
+end)
+
+log("✅ Server hopper is running!")
