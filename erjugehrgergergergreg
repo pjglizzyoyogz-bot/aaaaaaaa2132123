@@ -267,20 +267,24 @@ local function mainLoop()
     
     -- Removed auto-block of current server; we only block the NEXT one we select (pre-block before teleport)
     
-    -- Test JsonBin connection
-    log("🔍 Testing JsonBin connection...")
-    local testData = readFromJsonBin()
-    
-    if not testData then
-        logError("❌ CANNOT CONNECT TO JSONBIN!")
-        logError("Please check:")
-        logError("1. HttpService is enabled in your executor")
-        logError("2. JsonBin API key is correct")
-        logError("3. JsonBin Bin ID is correct")
-        return
-    end
-    
-    log("✅ JsonBin connection successful!")
+    -- Resilient JsonBin connection (keep retrying)
+    local attempt = 0
+    local testData
+    repeat
+        attempt += 1
+        if attempt == 1 then
+            log("🔍 Testing JsonBin connection...")
+        else
+            logWarning("Retrying JsonBin connection (attempt " .. attempt .. ")")
+        end
+        testData = readFromJsonBin(true)
+        if not testData then
+            local backoff = math.min(10, 1 * 2 ^ math.min(6, attempt - 1)) -- 1,2,4,8,10,10...
+            logWarning("JsonBin unreachable. Backing off for " .. backoff .. "s")
+            wait(backoff)
+        end
+    until testData ~= nil
+    log("✅ JsonBin connection established after " .. attempt .. " attempt(s)")
     log("📊 Found " .. #(testData.availableJobIds or {}) .. " available JobIds")
     log("")
     
