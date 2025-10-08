@@ -219,6 +219,8 @@ local function parseErrorReason(errorMsg)
     
     if string.find(errorLower, "full") or string.find(errorLower, "capacity") then
         return "Server is full"
+    elseif string.find(errorLower, "can't join private") or string.find(errorLower, "cant join private") or string.find(errorLower, "unauthorized") then
+        return "Private / Unauthorized instance"
     elseif string.find(errorLower, "invalid") or string.find(errorLower, "not found") then
         return "Invalid or closed server"
     elseif string.find(errorLower, "restricted") or string.find(errorLower, "private") then
