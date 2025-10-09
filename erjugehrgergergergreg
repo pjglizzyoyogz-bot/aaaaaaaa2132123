@@ -80,21 +80,83 @@ local function readLocalFile()
         logError("Executor does not expose file APIs (isfile/readfile)")
         return nil
     end
+
+    -- helper to trim and check emptiness
+    local function isEmptyString(s)
+        return s == nil or s == "" or not tostring(s):find("%S")
+    end
+
+    -- ensure file exists; if not, create a minimal valid structure
     if not isfile(CONFIG.LOCAL_FILE_PATH) then
-        logWarning("Local file missing: " .. CONFIG.LOCAL_FILE_PATH)
-        return nil
+        logWarning("Local file missing: " .. CONFIG.LOCAL_FILE_PATH .. " -> creating base file")
+        if writefile then
+            local seed = { availableJobIds = {}, blocklist = {}, stats = { created = os.time(), reason = "created_missing" } }
+            local okCreate, errCreate = pcall(function()
+                writefile(CONFIG.LOCAL_FILE_PATH, HttpService:JSONEncode(seed))
+            end)
+            if not okCreate then
+                logError("Failed to create base file: " .. tostring(errCreate))
+                return nil
+            end
+        else
+            return nil
+        end
     end
-    local ok, content = pcall(readfile, CONFIG.LOCAL_FILE_PATH)
-    if not ok then
-        logError("Failed to read local file: " .. tostring(content))
-        return nil
+
+    -- read with a few retries to survive concurrent partial writes
+    local lastErr
+    for attempt = 1, 5 do
+        local okRead, content = pcall(readfile, CONFIG.LOCAL_FILE_PATH)
+        if not okRead then
+            lastErr = content
+            logWarning("Read attempt " .. attempt .. " failed: " .. tostring(content))
+            wait(0.2)
+        else
+            if isEmptyString(content) then
+                -- empty/whitespace-only -> recreate a base file
+                logWarning("Local file is empty -> recreating base JSON")
+                if writefile then
+                    local seed = { availableJobIds = {}, blocklist = {}, stats = { recreated = os.time(), reason = "empty" } }
+                    pcall(function() writefile(CONFIG.LOCAL_FILE_PATH, HttpService:JSONEncode(seed)) end)
+                    return seed
+                else
+                    return nil
+                end
+            end
+            local okDecode, decoded = pcall(function()
+                return HttpService:JSONDecode(content)
+            end)
+            if okDecode and type(decoded) == "table" then
+                return decoded
+            else
+                lastErr = decoded
+                -- likely read during a write (partial JSON); brief retry
+                if attempt < 5 then wait(0.25) end
+            end
+        end
     end
-    local success, decoded = pcall(function() return HttpService:JSONDecode(content) end)
-    if not success then
-        logError("Invalid JSON in local file")
-        return nil
+
+    -- If we get here, decoding kept failing. Try to recover by rewriting a sane base.
+    logWarning("Invalid JSON in local file after retries -> attempting recovery")
+    local seedFromCache = { availableJobIds = {}, blocklist = {}, stats = { recovered = os.time(), reason = "corrupt_after_retries" } }
+    if _cache and _cache.data then
+        seedFromCache.availableJobIds = _cache.data.availableJobIds or {}
+        seedFromCache.blocklist = _cache.data.blocklist or {}
+        if type(_cache.data.stats) == "table" then
+            for k, v in pairs(_cache.data.stats) do seedFromCache.stats[k] = v end
+        end
+        seedFromCache.stats.recoveredFromCache = true
     end
-    return decoded
+    if writefile then
+        local okWrite = pcall(function()
+            writefile(CONFIG.LOCAL_FILE_PATH, HttpService:JSONEncode(seedFromCache))
+        end)
+        if okWrite then
+            return seedFromCache
+        end
+    end
+    logError("Invalid JSON in local file (unrecoverable)")
+    return nil
 end
 
 local function writeLocalFile(tbl)
@@ -141,6 +203,11 @@ local function storageRead(force)
         _cache.data = result
         _cache.ts = now
         return result
+    end
+    -- Fallback to cached data to avoid stalls when reads temporarily fail
+    if _cache.data then
+        if not CONFIG.FAST_MODE then log("Using cached data due to read failure") end
+        return _cache.data
     end
     return nil
 end
@@ -207,7 +274,10 @@ local function blockJobId(jobId, reason)
     table.insert(_G.ServerHopperShared.localBlocklist, jobId)
     
     local data = storageRead()
-    if not data then return false end
+    if not data then
+        -- Create a minimal structure so we can still persist the block
+        data = { availableJobIds = {}, blocklist = {} }
+    end
     
     -- Add to blocklist if not already there
     local blocklist = data.blocklist or {}
@@ -248,7 +318,9 @@ end
 local function preBlockJobId(jobId)
     -- read cached (force refresh)
     local data = storageRead(true)
-    if not data then return false end
+    if not data then
+        data = { availableJobIds = {}, blocklist = {} }
+    end
     data.blocklist = data.blocklist or {}
     -- already blocked? then fine
     for _, b in ipairs(data.blocklist) do if b == jobId then return true end end
