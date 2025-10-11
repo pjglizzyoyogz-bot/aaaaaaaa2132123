@@ -1,26 +1,15 @@
--- FULLY AUTOMATIC ROBLOX HOPPER - DIRECT JSONSILO CONNECTION
--- This script connects DIRECTLY to JsonSilo public JSON endpoint
--- NO backend server needed. Public URL is read-only; write attempts may fail silently if not permitted.
+-- FULLY AUTOMATIC ROBLOX HOPPER - LOCAL FILE MODE
+-- This script reads from a local JSON file populated by the scanner
+-- No HTTP requests needed - pure local file mode
 
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 local Players = game:GetService("Players")
 
--- Use executor's request function (same as your working script)
-local request = syn and syn.request or http and http.request or http_request or fluxus and fluxus.request
-if not request then 
-    error("❌ No HTTP request function found! Your executor may not support HTTP requests.") 
-end
-
 -- ===== CONFIGURATION =====
 local CONFIG = {
-    -- JsonSilo Configuration
-    STORAGE_MODE = "local", -- "local" or "jsonsilo"
+    -- Local File Configuration
     LOCAL_FILE_PATH = "C:/Users/ghait/AppData/Local/Wave/workspace/JobidJson.json", -- Windows absolute path
-    JSONSILO_PUBLIC_URL = "https://api.jsonsilo.com/public/cf8de3c7-8be4-4df5-aae5-1403645bab01",
-    JSONSILO_WRITE_URL = "https://api.jsonsilo.com/public/cf8de3c7-8be4-4df5-aae5-1403645bab01",
-    JSONSILO_API_KEY = nil,
-    JSONSILO_API_KEY_HEADER = "X-API-Key",
     
     -- Game Configuration
     UNIVERSE_ID = 109983668079237, -- place/universe id used for teleport (ensure this is PlaceId, not universe id if different)
@@ -31,7 +20,7 @@ local CONFIG = {
     RETRY_DELAY = 0.5,     -- delay after failure (short)
     MAX_RETRY_ATTEMPTS = 3,
     FAST_MODE = true,      -- enable aggressive speed optimizations
-    JSON_CACHE_TTL = 2,    -- seconds to cache JsonBin read
+    JSON_CACHE_TTL = 2,    -- seconds to cache file read
     MAX_LOOP_BURST = 15,   -- max rapid iterations before yielding
     
     -- Client ID (unique per account)
@@ -41,7 +30,7 @@ local CONFIG = {
 -- ===== SHARED GLOBAL STATE (across all accounts) =====
 _G.ServerHopperShared = _G.ServerHopperShared or {
     assignedJobIds = {}, -- JobIds currently assigned to any account
-    localBlocklist = {} -- Local blocklist cached from JsonBin
+    localBlocklist = {} -- Local blocklist cached from file
 }
 
 -- ===== STATE =====
@@ -64,16 +53,8 @@ end
 local function logError(message) log(message, "ERROR") end
 local function logWarning(message) log(message, "WARN") end
 
--- ===== STORAGE (JsonSilo / Local File) =====
+-- ===== STORAGE (Local File) =====
 local _cache = { data = nil, ts = 0 }
-
-local function buildHeaders(isWrite)
-    local headers = { ["Content-Type"] = "application/json" }
-    if CONFIG.JSONSILO_API_KEY and CONFIG.JSONSILO_API_KEY ~= "" then
-        headers[CONFIG.JSONSILO_API_KEY_HEADER] = CONFIG.JSONSILO_API_KEY
-    end
-    return headers
-end
 
 local function readLocalFile()
     if not isfile or not readfile then
@@ -176,29 +157,9 @@ local function storageRead(force)
     if not force and _cache.data and (now - _cache.ts) < CONFIG.JSON_CACHE_TTL then
         return _cache.data
     end
-    local result = nil
-    if CONFIG.STORAGE_MODE == "local" then
-        result = readLocalFile()
-    else
-        if not CONFIG.FAST_MODE then log("📡 Reading from JsonSilo...") end
-        local success, resp = pcall(function()
-            local response = request({
-                Url = CONFIG.JSONSILO_PUBLIC_URL,
-                Method = "GET",
-                Headers = buildHeaders(false)
-            })
-            if response.Success and response.StatusCode == 200 then
-                return HttpService:JSONDecode(response.Body)
-            else
-                error("HTTP " .. tostring(response.StatusCode))
-            end
-        end)
-        if success then
-            result = resp
-        else
-            logError("Failed to read JsonSilo: " .. tostring(resp))
-        end
-    end
+    
+    local result = readLocalFile()
+    
     if result then
         _cache.data = result
         _cache.ts = now
@@ -213,26 +174,7 @@ local function storageRead(force)
 end
 
 local function storageWrite(data)
-    if CONFIG.STORAGE_MODE == "local" then
-        return writeLocalFile(data)
-    end
-    if not CONFIG.FAST_MODE then log("💾 Writing to JsonSilo...") end
-    local success, result = pcall(function()
-        local response = request({
-            Url = CONFIG.JSONSILO_WRITE_URL,
-            Method = "PUT",
-            Headers = buildHeaders(true),
-            Body = HttpService:JSONEncode(data)
-        })
-        if response.Success and (response.StatusCode == 200 or response.StatusCode == 201) then return true else error("HTTP " .. tostring(response.StatusCode)) end
-    end)
-    if success then
-        _cache.data = data
-        _cache.ts = os.clock()
-        return true
-    end
-    logWarning("Write failed: " .. tostring(result))
-    return false
+    return writeLocalFile(data)
 end
 
 -- ===== JOB ID MANAGEMENT =====
@@ -384,42 +326,33 @@ end
 -- ===== MAIN LOOP =====
 local function mainLoop()
     log("╔════════════════════════════════════════════════════════════╗")
-    local mode = CONFIG.STORAGE_MODE == "local" and "LOCAL FILE" or "JSONSILO"
-    log("║     🎮 FULLY AUTOMATIC SERVER HOPPER - " .. mode .. " MODE    ║")
+    log("║     🎮 FULLY AUTOMATIC SERVER HOPPER - LOCAL FILE MODE    ║")
     log("╚════════════════════════════════════════════════════════════╝")
     log("Client ID: " .. CONFIG.CLIENT_ID)
     log("Universe ID: " .. CONFIG.UNIVERSE_ID)
-    if CONFIG.STORAGE_MODE == "local" then
-        log("Local File: " .. CONFIG.LOCAL_FILE_PATH)
-    else
-        log("JsonSilo URL: " .. CONFIG.JSONSILO_PUBLIC_URL)
-    end
+    log("Local File: " .. CONFIG.LOCAL_FILE_PATH)
     log("════════════════════════════════════════════════════════════")
     
     -- Removed auto-block of current server; we only block the NEXT one we select (pre-block before teleport)
     
-    -- Resilient JsonBin connection (keep retrying)
+    -- Resilient file loading (keep retrying)
     local attempt = 0
     local testData
     repeat
         attempt += 1
         if attempt == 1 then
-            if CONFIG.STORAGE_MODE == "local" then
-                log("🔍 Loading local file...")
-            else
-                log("🔍 Testing JsonSilo connection...")
-            end
+            log("🔍 Loading local file...")
         else
-            logWarning("Retrying storage read (attempt " .. attempt .. ")")
+            logWarning("Retrying file read (attempt " .. attempt .. ")")
         end
-    testData = storageRead(true)
+        testData = storageRead(true)
         if not testData then
             local backoff = math.min(10, 1 * 2 ^ math.min(6, attempt - 1)) -- 1,2,4,8,10,10...
-            logWarning("Storage unreadable. Backing off for " .. backoff .. "s")
+            logWarning("File unreadable. Backing off for " .. backoff .. "s")
             wait(backoff)
         end
     until testData ~= nil
-    log("✅ Storage ready after " .. attempt .. " attempt(s)")
+    log("✅ File ready after " .. attempt .. " attempt(s)")
     log("📊 Found " .. #(testData.availableJobIds or {}) .. " available JobIds")
     log("")
     
@@ -486,8 +419,8 @@ Players.LocalPlayer.OnTeleport:Connect(function(state)
 end)
 
 -- ===== STARTUP =====
-log("Initializing direct JsonBin hopper...")
-wait(2)
+log("Initializing local file hopper...")
+wait(0.1)
 
 -- Start the main loop
 spawn(function()
